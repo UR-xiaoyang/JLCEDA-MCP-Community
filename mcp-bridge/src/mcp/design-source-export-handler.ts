@@ -41,6 +41,25 @@ function getFileManager(): Record<string, unknown> {
 	return api;
 }
 
+async function readReferencedFootprintUuids(eda: Record<string, unknown>): Promise<{ available: boolean; uuids: string[] }> {
+	const api = eda.pcb_PrimitiveComponent;
+	if (!isPlainObjectRecord(api) || typeof api.getAll !== 'function')
+		return { available: false, uuids: [] };
+	const components = await (api.getAll as () => Promise<unknown>).call(api);
+	if (!Array.isArray(components))
+		return { available: false, uuids: [] };
+	const uuids = new Set<string>();
+	for (const component of components) {
+		const getter = (component as Record<string, unknown> | null)?.getState_Footprint;
+		if (typeof getter !== 'function')
+			continue;
+		const reference = getter.call(component);
+		if (isPlainObjectRecord(reference) && typeof reference.uuid === 'string' && reference.uuid.trim())
+			uuids.add(reference.uuid);
+	}
+	return { available: true, uuids: [...uuids] };
+}
+
 function textBytes(value: string): Uint8Array {
 	return new TextEncoder().encode(value);
 }
@@ -82,12 +101,38 @@ export async function handleDesignSourceExportTask(payload: unknown): Promise<un
 			throw new TypeError('EDA sys_FileManager.getDocumentSource returned an invalid result.');
 		return { ok: true, action, source: sourceSummary(source, includeData, maxBytes, previewBytes) };
 	}
+	const eda = getEdaRuntime();
+	const references = eda ? await readReferencedFootprintUuids(eda) : { available: false, uuids: [] };
 	const getDocumentFootprintSources = api.getDocumentFootprintSources;
-	if (typeof getDocumentFootprintSources !== 'function')
-		throw new TypeError('EDA sys_FileManager.getDocumentFootprintSources API is unavailable in this client version.');
+	if (typeof getDocumentFootprintSources !== 'function') {
+		return {
+			ok: false,
+			action,
+			complete: false,
+			total: 0,
+			returned: 0,
+			truncated: false,
+			sources: [],
+			referencedFootprintUuids: references.uuids,
+			reason: references.available ? 'native_footprint_sources_api_unavailable' : 'pcb_footprint_reference_inventory_unavailable',
+		};
+	}
 	const rawSources = await (getDocumentFootprintSources as () => Promise<unknown>).call(api);
 	if (!Array.isArray(rawSources))
 		throw new TypeError('EDA sys_FileManager.getDocumentFootprintSources returned an invalid result.');
+	if (rawSources.length === 0 && references.available && references.uuids.length > 0) {
+		return {
+			ok: false,
+			action,
+			complete: false,
+			total: 0,
+			returned: 0,
+			truncated: false,
+			sources: [],
+			referencedFootprintUuids: references.uuids,
+			reason: 'native_footprint_sources_empty_for_populated_pcb',
+		};
+	}
 	const limit = parseBoundedIntegerValue(input.limit, 50, 1, MAX_FOOTPRINTS);
 	let remainingDataBytes = maxBytes;
 	const sources = preserveBoundedArray(rawSources.slice(0, limit).map((item, index) => {
@@ -109,5 +154,5 @@ export async function handleDesignSourceExportTask(payload: unknown): Promise<un
 			source,
 		};
 	}));
-	return { ok: true, action, total: rawSources.length, returned: sources.length, truncated: rawSources.length > limit, sources };
+	return { ok: true, action, complete: true, total: rawSources.length, returned: sources.length, truncated: rawSources.length > limit, sources };
 }

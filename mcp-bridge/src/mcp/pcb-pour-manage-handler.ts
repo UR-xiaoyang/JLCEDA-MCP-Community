@@ -296,6 +296,103 @@ function unknownAfterWrite(action: Exclude<Action, 'read'>, error: unknown, cont
 	return { ok: false, action, scope: SCOPE, ...context, reason: 'post_write_readback_failed', error: toSafeErrorMessage(error), commitUnknown: true, readbackRequired: true, nativeCallSettled: true };
 }
 
+const REBUILD_DIAGNOSTIC_LIMIT = 40;
+const REBUILD_READBACK_ATTEMPTS = 3;
+
+function boundedDiagnosticList<T>(items: T[]): T[] {
+	return items.slice(0, REBUILD_DIAGNOSTIC_LIMIT);
+}
+
+function rebuildDiagnostics(nativeResult: unknown, before: Snapshot, after: Snapshot | undefined, primitiveId: string | undefined, rebuildPath: string, readbackAttempts: number, nativeReturnTypes: Record<string, number>): Record<string, unknown> {
+	const observed = after?.poured.filter(item => !primitiveId || item.pourPrimitiveId === primitiveId) ?? [];
+	let returned: PouredState[] = [];
+	let returnedReadable = false;
+	try {
+		if (Array.isArray(nativeResult)) {
+			returned = nativeResult.map(readPoured);
+			returnedReadable = true;
+		}
+	}
+	catch { /* 不可读的原生返回不影响已取得的页面诊断。 */ }
+	const returnedIds = new Set(returned.map(item => item.primitiveId));
+	const observedIds = new Set(observed.map(item => item.primitiveId));
+	const missingReturned = observed.filter(item => !returnedIds.has(item.primitiveId));
+	const missingObserved = returned.filter(item => !observedIds.has(item.primitiveId));
+	const summarize = (items: PouredState[]) => boundedDiagnosticList(items).map(item => ({
+		primitiveId: item.primitiveId.slice(0, 160),
+		pourPrimitiveId: item.pourPrimitiveId.slice(0, 160),
+		fillCount: item.fillCount,
+		fillGeometryDigest: item.fillGeometryDigest,
+	}));
+	return {
+		rebuildPath,
+		nativeReturnType: nativeResult === null ? 'null' : Array.isArray(nativeResult) ? 'array' : typeof nativeResult,
+		nativeReturnCount: Array.isArray(nativeResult) ? nativeResult.length : null,
+		nativeReturnTypes: { ...nativeReturnTypes },
+		returnedReadable,
+		observedCount: after ? observed.length : null,
+		missingReturnedCount: returnedReadable && after ? missingReturned.length : null,
+		missingObservedCount: returnedReadable && after ? missingObserved.length : null,
+		missingReturnedIds: boundedDiagnosticList(missingReturned).map(item => item.primitiveId.slice(0, 160)),
+		missingObservedIds: boundedDiagnosticList(missingObserved).map(item => item.primitiveId.slice(0, 160)),
+		returned: summarize(returned),
+		after: after ? { pourCount: after.pourCount, pouredCount: after.pouredCount, poured: summarize(after.poured) } : null,
+		diagnosticLimit: REBUILD_DIAGNOSTIC_LIMIT,
+		truncated: [returned.length, after?.pouredCount ?? 0, missingReturned.length, missingObserved.length].some(count => count > REBUILD_DIAGNOSTIC_LIMIT),
+		readbackAttempts,
+	};
+}
+
+function verifyRebuild(nativeResult: unknown, before: Snapshot, after: Snapshot, primitiveId: string | undefined, all: boolean, context: Record<string, unknown>): Record<string, unknown> {
+	if (!Array.isArray(nativeResult))
+		throw new TypeError('EDA rebuildCopperRegions did not return a poured array.');
+	const returnedPoured = nativeResult.map(readPoured);
+	const observedPoured = primitiveId
+		? after.poured.filter(item => item.pourPrimitiveId === primitiveId)
+		: after.poured;
+	const returnedIds = new Set(returnedPoured.map(item => item.primitiveId));
+	if (returnedIds.size !== returnedPoured.length || returnedPoured.length !== observedPoured.length
+		|| observedPoured.some(item => !returnedIds.has(item.primitiveId))) {
+		throw new Error('EDA rebuild returned an incomplete poured fill set.');
+	}
+	const returnedPourIds = new Set(returnedPoured.map(item => item.pourPrimitiveId));
+	const beforePourIds = new Set(before.pours.map(item => item.primitiveId));
+	const afterPourIds = new Set(after.pours.map(item => item.primitiveId));
+	if (beforePourIds.size !== afterPourIds.size || [...beforePourIds].some(id => !afterPourIds.has(id)))
+		throw new Error('EDA rebuild changed the pour boundaries.');
+	if (returnedPoured.some(item => !afterPourIds.has(item.pourPrimitiveId)))
+		throw new Error('EDA rebuild returned a fill for a missing pour.');
+	if (all && after.pours.some(item => !returnedPourIds.has(item.primitiveId)))
+		throw new Error('EDA rebuild did not return a fill for every pour.');
+	if (primitiveId && !returnedPourIds.has(primitiveId)) {
+		const beforeTargetPoured = before.poured.filter(item => item.pourPrimitiveId === primitiveId);
+		return {
+			ok: false,
+			action: 'rebuild',
+			scope: SCOPE,
+			...context,
+			reason: 'rebuild_no_target_fill',
+			applied: beforeTargetPoured.length > 0,
+			verified: false,
+			before: beforeTargetPoured,
+			after: observedPoured,
+			rebuildReturnedCount: returnedPoured.length,
+		};
+	}
+	for (const returned of returnedPoured) {
+		if (primitiveId && returned.pourPrimitiveId !== primitiveId)
+			throw new Error('EDA rebuild returned a fill for a different pour.');
+		const observed = after.poured.find(item => item.primitiveId === returned.primitiveId);
+		if (!observed
+			|| observed.pourPrimitiveId !== returned.pourPrimitiveId
+			|| observed.fillCount !== returned.fillCount
+			|| observed.fillGeometryDigest !== returned.fillGeometryDigest) {
+			throw new Error('EDA rebuilt fill is missing or differs on current-page readback.');
+		}
+	}
+	return { ok: true, action: 'rebuild', scope: SCOPE, ...context, verified: true, rebuildReturnedCount: nativeResult.length, ...after };
+}
+
 export async function handlePcbPourManageTask(payload: unknown): Promise<unknown> {
 	if (!isPlainObjectRecord(payload))
 		throw new TypeError('pcb_pour_manage payload must be an object.');
@@ -371,6 +468,12 @@ export async function handlePcbPourManageTask(payload: unknown): Promise<unknown
 	}
 	await assertSamePage(runtime, pageUuid);
 	let nativeResult: unknown;
+	const nativeReturnTypes: Record<string, number> = {};
+	const recordNativeType = (value: unknown) => {
+		const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+		nativeReturnTypes[type] = (nativeReturnTypes[type] ?? 0) + 1;
+	};
+	const rebuildPath = rebuildInstances ? 'per_pour' : 'batch';
 	try {
 		if (action === 'create') {
 			nativeResult = await (pourApi.create as (...args: unknown[]) => Promise<unknown>).call(
@@ -397,6 +500,7 @@ export async function handlePcbPourManageTask(payload: unknown): Promise<unknown
 			for (const target of rebuildInstances) {
 				await assertSamePage(runtime, pageUuid);
 				const result = await (target.rebuildCopperRegion as () => Promise<unknown>).call(target);
+				recordNativeType(result);
 				if (result !== undefined && result !== null)
 					results.push(result);
 			}
@@ -407,7 +511,32 @@ export async function handlePcbPourManageTask(payload: unknown): Promise<unknown
 		}
 	}
 	catch (error: unknown) {
+		if (action === 'rebuild')
+			context.rebuildDiagnostics = rebuildDiagnostics(nativeResult, before, undefined, primitiveId, rebuildPath, 0, nativeReturnTypes);
 		return unknownNativeWrite(action, error, context);
+	}
+	if (action === 'rebuild') {
+		if (!rebuildInstances)
+			recordNativeType(nativeResult);
+		let lastError: unknown;
+		let after: Snapshot | undefined;
+		for (let attempt = 1; attempt <= REBUILD_READBACK_ATTEMPTS; attempt++) {
+			try {
+				await assertSamePage(runtime, pageUuid);
+				after = await readSnapshot(runtime, pageUuid);
+				context.rebuildDiagnostics = rebuildDiagnostics(nativeResult, before, after, primitiveId, rebuildPath, attempt, nativeReturnTypes);
+				const result = verifyRebuild(nativeResult, before, after, primitiveId, payload.all === true, context);
+				if (result.ok || attempt === REBUILD_READBACK_ATTEMPTS)
+					return result;
+			}
+			catch (error: unknown) {
+				lastError = error;
+				context.rebuildDiagnostics = rebuildDiagnostics(nativeResult, before, after, primitiveId, rebuildPath, attempt, nativeReturnTypes);
+			}
+			if (attempt < REBUILD_READBACK_ATTEMPTS)
+				await new Promise(resolve => setTimeout(resolve, 100));
+		}
+		return unknownAfterWrite(action, lastError, context);
 	}
 	try {
 		const after = await readSnapshot(runtime, pageUuid);
@@ -533,53 +662,7 @@ export async function handlePcbPourManageTask(payload: unknown): Promise<unknown
 				throw new Error('EDA pour still exists after delete.');
 			return { ok: true, action, scope: SCOPE, pageUuid, primitiveId, deleted: true, verified: true };
 		}
-		if (!Array.isArray(nativeResult))
-			throw new TypeError('EDA rebuildCopperRegions did not return a poured array.');
-		const returnedPoured = nativeResult.map(readPoured);
-		const observedPoured = primitiveId
-			? after.poured.filter(item => item.pourPrimitiveId === primitiveId)
-			: after.poured;
-		const returnedIds = new Set(returnedPoured.map(item => item.primitiveId));
-		if (returnedIds.size !== returnedPoured.length || returnedPoured.length !== observedPoured.length
-			|| observedPoured.some(item => !returnedIds.has(item.primitiveId))) {
-			throw new Error('EDA rebuild returned an incomplete poured fill set.');
-		}
-		const returnedPourIds = new Set(returnedPoured.map(item => item.pourPrimitiveId));
-		const beforePourIds = new Set(before.pours.map(item => item.primitiveId));
-		const afterPourIds = new Set(after.pours.map(item => item.primitiveId));
-		if (beforePourIds.size !== afterPourIds.size || [...beforePourIds].some(id => !afterPourIds.has(id)))
-			throw new Error('EDA rebuild changed the pour boundaries.');
-		if (returnedPoured.some(item => !afterPourIds.has(item.pourPrimitiveId)))
-			throw new Error('EDA rebuild returned a fill for a missing pour.');
-		if (payload.all === true && after.pours.some(item => !returnedPourIds.has(item.primitiveId)))
-			throw new Error('EDA rebuild did not return a fill for every pour.');
-		if (primitiveId && !returnedPourIds.has(primitiveId)) {
-			const beforeTargetPoured = before.poured.filter(item => item.pourPrimitiveId === primitiveId);
-			return {
-				ok: false,
-				action,
-				scope: SCOPE,
-				...context,
-				reason: 'rebuild_no_target_fill',
-				applied: beforeTargetPoured.length > 0,
-				verified: false,
-				before: beforeTargetPoured,
-				after: observedPoured,
-				rebuildReturnedCount: returnedPoured.length,
-			};
-		}
-		for (const returned of returnedPoured) {
-			if (primitiveId && returned.pourPrimitiveId !== primitiveId)
-				throw new Error('EDA rebuild returned a fill for a different pour.');
-			const observed = after.poured.find(item => item.primitiveId === returned.primitiveId);
-			if (!observed
-				|| observed.pourPrimitiveId !== returned.pourPrimitiveId
-				|| observed.fillCount !== returned.fillCount
-				|| observed.fillGeometryDigest !== returned.fillGeometryDigest) {
-				throw new Error('EDA rebuilt fill is missing or differs on current-page readback.');
-			}
-		}
-		return { ok: true, action, scope: SCOPE, pageUuid, ...context, verified: true, rebuildReturnedCount: nativeResult.length, ...after };
+		throw new Error('Unsupported pour operation.');
 	}
 	catch (error: unknown) {
 		return unknownAfterWrite(action, error, context);

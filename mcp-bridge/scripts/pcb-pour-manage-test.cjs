@@ -241,6 +241,30 @@ async function main() {
 	assert.equal(rebuilt.ok, true);
 	assert.equal(rebuilt.all, false);
 	assert.equal(rebuilt.poured.find(item => item.pourPrimitiveId === 'new-1').fillCount, 1);
+	assert.equal(rebuilt.rebuildDiagnostics.nativeReturnCount, 1);
+	assert.equal(rebuilt.rebuildDiagnostics.readbackAttempts, 1);
+	const savedPouredGetAll = globalThis.eda.pcb_PrimitivePoured.getAll;
+	const syncBatchRebuild = pourApi.rebuildCopperRegions;
+	let pendingReadbacks = 0;
+	let priorPoured;
+	pourApi.rebuildCopperRegions = async (...args) => {
+		priorPoured = await savedPouredGetAll();
+		const result = await syncBatchRebuild(...args);
+		pendingReadbacks = 2;
+		return result;
+	};
+	globalThis.eda.pcb_PrimitivePoured.getAll = async () => pendingReadbacks-- > 0 ? priorPoured : savedPouredGetAll();
+	// Change the returned geometry so stale same-ID readback cannot pass.
+	const freshGeometryRebuild = pourApi.rebuildCopperRegions;
+	pourApi.rebuildCopperRegions = async (...args) => {
+		const result = await freshGeometryRebuild(...args);
+		poured.get('filled-new-1').fills = [fill('delayed', ['R', 12, 20, 100, 80, 0, 0])];
+		return result;
+	};
+	const delayed = await handlePcbPourManageTask({ action: 'rebuild', primitiveId: 'new-1' });
+	assert.deepEqual([delayed.ok, delayed.verified, delayed.rebuildDiagnostics.readbackAttempts], [true, true, 3], 'settle must read again without issuing another native rebuild');
+	globalThis.eda.pcb_PrimitivePoured.getAll = savedPouredGetAll;
+	pourApi.rebuildCopperRegions = syncBatchRebuild;
 	const rebuiltAll = await handlePcbPourManageTask({ action: 'rebuild', all: true });
 	assert.equal(rebuiltAll.all, true);
 	assert.equal(rebuiltAll.pouredCount, 2);
@@ -287,6 +311,14 @@ async function main() {
 	pourApi.rebuildCopperRegions = async () => [pouredPrimitive(poured.get('filled-pour-1'))];
 	const partialAllWithExistingFills = await handlePcbPourManageTask({ action: 'rebuild', all: true });
 	assert.deepEqual([partialAllWithExistingFills.commitUnknown, partialAllWithExistingFills.nativeCallSettled], [true, true], 'all-page rebuild must reject a partial returned fill set');
+	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.rebuildPath, 'batch');
+	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.nativeReturnType, 'array');
+	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.nativeReturnCount, 1);
+	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.observedCount, 2);
+	assert.deepEqual(partialAllWithExistingFills.rebuildDiagnostics.missingReturnedIds, ['filled-new-1']);
+	assert.deepEqual(partialAllWithExistingFills.rebuildDiagnostics.missingObservedIds, []);
+	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.after.poured[0].fillCount, 1);
+	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.readbackAttempts, 3);
 	const secondFill = poured.get('filled-new-1');
 	pourApi.rebuildCopperRegions = async () => {
 		poured.delete('filled-new-1');

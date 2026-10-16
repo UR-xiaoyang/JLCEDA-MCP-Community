@@ -1,4 +1,5 @@
 import { getEdaRuntime, isPlainObjectRecord, preserveBoundedArray, toSafeErrorMessage } from '../utils.ts';
+import { safeSchematicMetadata, validateSchematicMetadataPatch } from './schematic-component-metadata.ts';
 import { readNativeWireSegments } from './schematic-native-wire-segments.ts';
 import { handleSchematicReadTask } from './schematic-read-handler.ts';
 
@@ -23,6 +24,8 @@ interface ComponentState {
 	supplier: string | null;
 	supplierId: string | null;
 	otherProperty: Property;
+	component: { libraryUuid: string; uuid: string } | null;
+	componentReadable: boolean;
 }
 
 interface PinNetwork {
@@ -97,6 +100,22 @@ function readOtherProperty(value: unknown): Property {
 	return { ...value } as Property;
 }
 
+function readComponentBinding(primitive: unknown): Pick<ComponentState, 'component' | 'componentReadable'> {
+	// Official SCH types expose only Component; Symbol/Footprint have no public getters.
+	const getter = (primitive as Record<string, unknown> | null)?.getState_Component;
+	if (typeof getter !== 'function')
+		return { component: null, componentReadable: false };
+	try {
+		const value: unknown = getter.call(primitive);
+		if (value === undefined)
+			return { component: null, componentReadable: true };
+		if (isPlainObjectRecord(value) && typeof value.libraryUuid === 'string' && typeof value.uuid === 'string')
+			return { component: { libraryUuid: value.libraryUuid, uuid: value.uuid }, componentReadable: true };
+	}
+	catch { /* Expose unavailable binding state instead of inventing a reference. */ }
+	return { component: null, componentReadable: false };
+}
+
 function readComponent(primitive: unknown): ComponentState {
 	const primitiveId = requiredId(readState(primitive, 'getState_PrimitiveId'));
 	const type = readState(primitive, 'getState_ComponentType');
@@ -122,6 +141,7 @@ function readComponent(primitive: unknown): ComponentState {
 		supplier: optionalText(readState(primitive, 'getState_Supplier'), 'supplier'),
 		supplierId: optionalText(readState(primitive, 'getState_SupplierId'), 'supplierId'),
 		otherProperty: readOtherProperty(readState(primitive, 'getState_OtherProperty')),
+		...readComponentBinding(primitive),
 	};
 }
 
@@ -194,6 +214,7 @@ function requiredProperty(value: unknown): Record<string, unknown> {
 				throw new TypeError(`${key} must be a boolean.`);
 		}
 		else if (key === 'otherProperty') {
+			validateSchematicMetadataPatch(item);
 			readOtherProperty(item);
 		}
 		else if (item !== null && typeof item !== 'string') {
@@ -203,20 +224,41 @@ function requiredProperty(value: unknown): Record<string, unknown> {
 	return value;
 }
 
-function requestedValuesMatch(after: ComponentState, requested: Record<string, unknown>, fullOtherProperty: Property): boolean {
+function modificationMismatches(before: ComponentState, after: ComponentState, requested: Record<string, unknown>, fullOtherProperty: Property): Array<Record<string, unknown>> {
+	const mismatches: Array<Record<string, unknown>> = [];
+	const compare = (key: string, expected: unknown, actual: unknown): void => {
+		if (typeof expected === 'number' && typeof actual === 'number' ? Math.abs(actual - expected) <= COORDINATE_EPSILON : actual === expected)
+			return;
+		mismatches.push({ key, expected, actual: actual ?? null });
+	};
 	for (const [key, expected] of Object.entries(requested)) {
-		if (key === 'otherProperty')
-			continue;
-		const actual = after[key as keyof ComponentState];
-		if (typeof expected === 'number' && typeof actual === 'number') {
-			if (Math.abs(actual - expected) > 1e-6)
-				return false;
+		if (key !== 'otherProperty')
+			compare(key, expected, after[key as keyof ComponentState]);
+	}
+	for (const [key, value] of Object.entries(fullOtherProperty))
+		compare(`otherProperty.${key}`, value, Object.hasOwn(after.otherProperty, key) ? after.otherProperty[key] : undefined);
+	if (before.componentReadable) {
+		if (!after.componentReadable) {
+			mismatches.push({ key: 'component', expected: before.component, actual: null, reason: 'binding_unreadable' });
 		}
-		else if (actual !== expected) {
-			return false;
+		else if (before.component && after.component) {
+			compare('component.libraryUuid', before.component.libraryUuid, after.component.libraryUuid);
+			compare('component.uuid', before.component.uuid, after.component.uuid);
+		}
+		else {
+			compare('component', before.component, after.component);
 		}
 	}
-	return Object.entries(fullOtherProperty).every(([key, value]) => Object.hasOwn(after.otherProperty, key) && after.otherProperty[key] === value);
+	return mismatches;
+}
+
+function bindingVerification(before: ComponentState, after: ComponentState): Record<string, unknown> {
+	return {
+		verified: false,
+		checked: before.componentReadable && after.componentReadable ? ['component'] : [],
+		unavailable: [...(before.componentReadable && after.componentReadable ? [] : ['component']), 'symbol', 'footprint'],
+		reason: 'Only getState_Component is public in the schematic API types; unavailable bindings cannot be verified.',
+	};
 }
 
 function wireSegments(line: unknown): Segment[] {
@@ -395,7 +437,7 @@ export async function handleSchematicComponentEditTask(payload: unknown): Promis
 	const target = targetEntry.primitive;
 	const before = targetEntry.state;
 	if (action === 'modify') {
-		const fullOtherProperty = { ...before.otherProperty, ...(property!.otherProperty as Property | undefined) };
+		const fullOtherProperty = { ...safeSchematicMetadata(before.otherProperty), ...(property!.otherProperty as Property | undefined) } as Property;
 		const update = { ...property!, otherProperty: fullOtherProperty };
 		const changesGeometry = ['x', 'y', 'rotation', 'mirror'].some(field => Object.hasOwn(property!, field)
 			&& property![field] !== before[field as keyof ComponentState]);
@@ -414,8 +456,12 @@ export async function handleSchematicComponentEditTask(payload: unknown): Promis
 			await assertSamePage(runtime, pageUuid);
 			assertCurrentPartEntries(afterEntries, afterIds);
 			const after = afterEntries.find(entry => entry.state.primitiveId === primitiveId)?.state;
-			if (!after || after.primitiveId !== primitiveId || !requestedValuesMatch(after, property!, fullOtherProperty))
-				throw new Error('EDA component state differs from the requested modification.');
+			if (!after || after.primitiveId !== primitiveId)
+				throw new Error('EDA component is missing after the requested modification.');
+			const mismatches = modificationMismatches(before, after, property!, fullOtherProperty);
+			const binding = bindingVerification(before, after);
+			if (mismatches.length)
+				return { ok: false, action, scope: SCOPE, pageUuid, primitiveId, reason: 'post_write_readback_mismatch', committed: true, verified: false, commitUnknown: true, readbackRequired: true, nativeCallSettled: true, before, after, mismatches, bindingVerification: binding };
 			if (beforePinNetworks) {
 				const afterPinNetworks = await readPinNetworks(runtime, primitiveId!, pageUuid);
 				await assertSamePage(runtime, pageUuid);
@@ -423,7 +469,7 @@ export async function handleSchematicComponentEditTask(payload: unknown): Promis
 				if (changes.length > 0)
 					return { ok: false, action, scope: SCOPE, pageUuid, primitiveId, reason: 'pin_network_changed', committed: true, verified: false, commitUnknown: true, readbackRequired: true, nativeCallSettled: true, before, after, pinNetworkChanges: changes };
 			}
-			return { ok: true, action, scope: SCOPE, pageUuid, primitiveId, verified: true, before, after };
+			return { ok: true, action, scope: SCOPE, pageUuid, primitiveId, verified: true, before, after, bindingVerification: binding };
 		}
 		catch (error: unknown) {
 			return unknownAfterWrite(action, primitiveId!, error, before);
