@@ -50,6 +50,21 @@ async function main() {
 	assert.equal(populated.total, 1);
 	assert.equal(populated.sources[0].source.data, 'FOOTPRINT: one');
 
+	setRuntime({
+		sources: [{ footprintUuid: 'fp-1', documentSource: 'FOOTPRINT: one' }],
+		components: [component({ libraryUuid: 'lib', uuid: 'fp-1' }), component({ libraryUuid: 'lib', uuid: 'fp-2' })],
+	});
+	const partial = await handleDesignSourceExportTask({ action: 'footprints' });
+	assert.deepEqual([partial.ok, partial.complete, partial.total, partial.missingReferencedFootprintCount], [true, false, 1, 1]);
+	assert.deepEqual(partial.missingReferencedFootprintUuids, ['fp-2']);
+
+	setRuntime({
+		sources: [{ footprintUuid: 'fp-1', documentSource: 'FOOTPRINT: one' }, { footprintUuid: 'fp-2', documentSource: 'FOOTPRINT: two' }],
+		components: [component({ libraryUuid: 'lib', uuid: 'fp-1' })],
+	});
+	const truncated = await handleDesignSourceExportTask({ action: 'footprints', limit: 1 });
+	assert.deepEqual([truncated.ok, truncated.complete, truncated.truncated, truncated.returned], [true, false, true, 1], 'a truncated list must not claim completeness');
+
 	setRuntime({ sources: [], components: [component({ libraryUuid: 'lib', uuid: 'fp-1' })], method: false });
 	const unavailable = await handleDesignSourceExportTask({ action: 'footprints' });
 	assert.equal(unavailable.ok, false);

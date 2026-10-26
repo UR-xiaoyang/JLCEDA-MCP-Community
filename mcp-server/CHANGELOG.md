@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- 配合 Bridge 更新 `pcb_routing_edit` 与 `pcb_pour_manage` 描述：拆线/合并归一覆盖核验，以及重建以当前页回读为权威、部分或空原生返回不再视为缺失填充。
+- 工具定义仍为 58 个，输入 schema 未变；`npm test`（含 build、smoke、bridge、pcb-import、dispatcher）通过。
+
 ## [2.3.10] - 2026-10-05
 
 - 配合 Bridge 修正原生 Wire.line 读取格式：每 4 个坐标为独立端点对，连续创建/修改请求和原始 DTO 保持不变；更新导线使用指导。

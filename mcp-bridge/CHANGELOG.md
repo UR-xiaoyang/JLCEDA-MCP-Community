@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- `pcb_routing_edit` 直线修改改为按请求几何与回读中实际变化的图元核验：原生在修改后新产生的同网交点处拆线（#94 报告场景）、以及与原共线相邻段合并时，均按完整覆盖判定，返回 `normalization.replacedPrimitiveIds`、`mergedPrimitiveIds` 和 `replacementPrimitiveIds`；覆盖不足、网络/层/线宽/锁定不符或出现额外铜仍保留隔离。整页铜线快照上限由 2048 提升到 20000，避免高密度 PCB 无法修改直线。
+- `pcb_pour_manage` 重建以当前页回读为权威：原生只返回部分或空填充集合、或对未变化覆铜返回 `null` 时，只要目标覆铜仍有可读填充即返回 `verified:true`、`verificationScope:"page_readback"` 与 `nativeReturnCoveredObservedCount`；已填充覆铜的填充丢失、返回填充与回读不一致仍进入隔离（#95）。
+- `design_source_export` 的 `footprints` 动作在原生列表不完整时返回 `missingReferencedFootprintUuids` 与 `missingReferencedFootprintCount`，被 `limit` 截断时不再声明 `complete:true`（#93 跟进）。
+- 回归：`pcb-routing-split-modify-test.cjs` 与 `schematic-component-reserved-test.cjs` 此前未接入 `npm run build`，现已纳入 `test:pcb-routing` 和 `test:schematic-components`；新增新交点拆线、共线合并、高密度快照、空/部分/`null` 原生返回与截断完整性用例。
+- 本轮仅以本地 fixture/mock 验证并通过完整 `npm run build`、`npm run lint`、`npm run typecheck`；未在 EDA 宿主实测，#93 至 #96 的实机确认仍待完成。
+
 ## [2.3.10] - 2026-10-05
 
 - 新增共享原生导线段解析器，Wire.line 每 4 个坐标对应实际 LINE 的独立端点对，不在相邻端点对之间虚构线段；连续创建/修改请求、原生参数与 DTO 保持不变。

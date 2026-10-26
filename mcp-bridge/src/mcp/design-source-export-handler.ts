@@ -134,6 +134,14 @@ export async function handleDesignSourceExportTask(payload: unknown): Promise<un
 		};
 	}
 	const limit = parseBoundedIntegerValue(input.limit, 50, 1, MAX_FOOTPRINTS);
+	const truncated = rawSources.length > limit;
+	const listedUuids = new Set(rawSources
+		.filter((item): item is Record<string, unknown> => isPlainObjectRecord(item) && typeof item.footprintUuid === 'string')
+		.map(item => item.footprintUuid as string));
+	// A partial native list must not read as a complete inventory of the PCB.
+	const missingReferencedFootprintUuids = references.available
+		? references.uuids.filter(uuid => !listedUuids.has(uuid))
+		: [];
 	let remainingDataBytes = maxBytes;
 	const sources = preserveBoundedArray(rawSources.slice(0, limit).map((item, index) => {
 		if (!isPlainObjectRecord(item) || typeof item.footprintUuid !== 'string' || typeof item.documentSource !== 'string')
@@ -154,5 +162,16 @@ export async function handleDesignSourceExportTask(payload: unknown): Promise<un
 			source,
 		};
 	}));
-	return { ok: true, action, complete: true, total: rawSources.length, returned: sources.length, truncated: rawSources.length > limit, sources };
+	return {
+		ok: true,
+		action,
+		complete: !truncated && missingReferencedFootprintUuids.length === 0,
+		total: rawSources.length,
+		returned: sources.length,
+		truncated,
+		...(missingReferencedFootprintUuids.length > 0
+			? { referencedFootprintUuids: references.uuids, missingReferencedFootprintUuids, missingReferencedFootprintCount: missingReferencedFootprintUuids.length }
+			: {}),
+		sources,
+	};
 }

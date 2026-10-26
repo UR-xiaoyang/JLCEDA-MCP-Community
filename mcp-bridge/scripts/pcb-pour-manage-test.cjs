@@ -243,6 +243,14 @@ async function main() {
 	assert.equal(rebuilt.poured.find(item => item.pourPrimitiveId === 'new-1').fillCount, 1);
 	assert.equal(rebuilt.rebuildDiagnostics.nativeReturnCount, 1);
 	assert.equal(rebuilt.rebuildDiagnostics.readbackAttempts, 1);
+	// #95：原生对未变化的 pour 返回 null 时不能当作缺失填充。
+	const nativeNullRebuild = pourApi.rebuildCopperRegions;
+	pourApi.rebuildCopperRegions = async () => null;
+	const nullReturn = await handlePcbPourManageTask({ action: 'rebuild', primitiveId: 'new-1' });
+	assert.deepEqual([nullReturn.ok, nullReturn.verified, nullReturn.nativeReturnCoveredObservedCount], [true, true, 0], 'a null native return must fall back to page readback');
+	assert.equal(nullReturn.rebuildDiagnostics.nativeReturnType, 'null');
+	assert.equal(nullReturn.rebuildDiagnostics.observedCount, 1);
+	pourApi.rebuildCopperRegions = nativeNullRebuild;
 	const savedPouredGetAll = globalThis.eda.pcb_PrimitivePoured.getAll;
 	const syncBatchRebuild = pourApi.rebuildCopperRegions;
 	let pendingReadbacks = 0;
@@ -306,11 +314,14 @@ async function main() {
 	pourApi.rebuildCopperRegions = savedBatchRebuild;
 	const nativeAllRebuild = pourApi.rebuildCopperRegions;
 	pourApi.rebuildCopperRegions = async () => [];
-	const emptyAllWithExistingFills = await handlePcbPourManageTask({ action: 'rebuild', all: true });
-	assert.deepEqual([emptyAllWithExistingFills.commitUnknown, emptyAllWithExistingFills.nativeCallSettled], [true, true], 'all-page rebuild must reject an empty result while fills remain');
+	const emptyReturnWithReadableFills = await handlePcbPourManageTask({ action: 'rebuild', all: true });
+	assert.deepEqual([emptyReturnWithReadableFills.ok, emptyReturnWithReadableFills.verified, emptyReturnWithReadableFills.verificationScope], [true, true, 'page_readback'], '#95：原生返回空集合不代表填充缺失，当前页回读才是权威证据');
+	assert.equal(emptyReturnWithReadableFills.rebuildDiagnostics.nativeReturnCount, 0);
+	assert.equal(emptyReturnWithReadableFills.nativeReturnCoveredObservedCount, 0);
 	pourApi.rebuildCopperRegions = async () => [pouredPrimitive(poured.get('filled-pour-1'))];
 	const partialAllWithExistingFills = await handlePcbPourManageTask({ action: 'rebuild', all: true });
-	assert.deepEqual([partialAllWithExistingFills.commitUnknown, partialAllWithExistingFills.nativeCallSettled], [true, true], 'all-page rebuild must reject a partial returned fill set');
+	assert.deepEqual([partialAllWithExistingFills.ok, partialAllWithExistingFills.verified, partialAllWithExistingFills.commitUnknown], [true, true, undefined], '#95：原生只返回部分填充时，完整回读必须放行');
+	assert.equal(partialAllWithExistingFills.nativeReturnCoveredObservedCount, 1);
 	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.rebuildPath, 'batch');
 	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.nativeReturnType, 'array');
 	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.nativeReturnCount, 1);
@@ -318,7 +329,7 @@ async function main() {
 	assert.deepEqual(partialAllWithExistingFills.rebuildDiagnostics.missingReturnedIds, ['filled-new-1']);
 	assert.deepEqual(partialAllWithExistingFills.rebuildDiagnostics.missingObservedIds, []);
 	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.after.poured[0].fillCount, 1);
-	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.readbackAttempts, 3);
+	assert.equal(partialAllWithExistingFills.rebuildDiagnostics.readbackAttempts, 1);
 	const secondFill = poured.get('filled-new-1');
 	pourApi.rebuildCopperRegions = async () => {
 		poured.delete('filled-new-1');

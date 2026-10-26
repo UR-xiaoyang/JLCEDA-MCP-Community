@@ -19,7 +19,7 @@ function original() {
 function split() {
 	return [line('a', 0, 0, 10, 0), line('b', 20, 0, 10, 0), line('c', 20, 0, 30, 0), line('d', 10, -10, 10, 0), line('e', 10, 0, 10, 10), line('f', 20, -10, 20, 0), line('g', 20, 0, 20, 10)];
 }
-async function run(after, { before = original(), timeout = false, changePage = false } = {}) {
+async function run(after, { before = original(), timeout = false, changePage = false, property = { startY: 0 } } = {}) {
 	let states = before;
 	let writes = 0;
 	let page = 'pcb';
@@ -44,7 +44,7 @@ async function run(after, { before = original(), timeout = false, changePage = f
 			},
 		},
 	};
-	const result = await toSerializableAsync(await handlePcbRoutingEditTask({ action: 'modify', kind: 'line', primitiveId: 'target', property: { startY: 0 } }));
+	const result = await toSerializableAsync(await handlePcbRoutingEditTask({ action: 'modify', kind: 'line', primitiveId: 'target', property }));
 	return { result, writes };
 }
 async function main() {
@@ -85,6 +85,46 @@ async function main() {
 	assert.equal(timedOut.nativeCallSettled, false);
 	assert.equal(requiresHostRestartForResult('/bridge/jlceda/pcb/routing-edit', {}, timedOut), true);
 	assert.equal((await run(split(), { changePage: true })).result.commitUnknown, true);
+	// #94 的实际场景：旧线与两条支路不相交，只有修改后的线才产生新的交点。
+	const extensionBefore = [
+		line('target', 0, 0, 10, 0),
+		line('cross-a', 15, -5, 15, 5),
+		line('cross-b', 20, -5, 20, 5),
+	];
+	const extensionAfter = [
+		line('t1', 0, 0, 15, 0),
+		line('t2', 15, 0, 20, 0),
+		line('a1', 15, -5, 15, 0),
+		line('a2', 15, 0, 15, 5),
+		line('b1', 20, -5, 20, 0),
+		line('b2', 20, 0, 20, 5),
+	];
+	const extension = await run(extensionAfter, { before: extensionBefore, property: { endX: 20 } });
+	assert.equal(extension.result.ok, true, 'a modification that creates new intersections must verify');
+	assert.deepEqual([...extension.result.primitiveIds].sort(), ['t1', 't2']);
+	assert.deepEqual([...extension.result.normalization.replacedPrimitiveIds].sort(), ['cross-a', 'cross-b']);
+	assert.equal(extension.result.commitUnknown, undefined);
+	for (const [name, mutate] of [
+		['new neighbour gap', rows => rows.filter(row => row.primitiveId !== 'a2')],
+		['new neighbour extension', rows => rows.map(row => row.primitiveId === 'b2' ? { ...row, endY: 6 } : row)],
+		['new copper outside', rows => [...rows, line('extra', 25, 0, 25, 10)]],
+	]) {
+		const rejected = (await run(mutate(extensionAfter), { before: extensionBefore, property: { endX: 20 } })).result;
+		assert.equal(rejected.ok, false, name);
+		assert.equal(rejected.commitUnknown, true, name);
+	}
+	// 原生把改后的线段与共线相邻段合并成一个 primitive。
+	const mergeBefore = [line('target', 0, 0, 20, 0), line('tail', 20, 0, 40, 0)];
+	const merge = await run([line('merged', 0, 0, 40, 0)], { before: mergeBefore, property: { endX: 30 } });
+	assert.equal(merge.result.ok, true, 'a native merge with existing collinear copper must verify');
+	assert.deepEqual(merge.result.normalization.mergedPrimitiveIds, ['merged']);
+	const mergeExtended = await run([line('merged', 0, 0, 45, 0)], { before: mergeBefore, property: { endX: 30 } });
+	assert.equal(mergeExtended.result.ok, false, 'a merge that adds copper beyond the previous extent must not verify');
+	// 高密度板：整页快照上限不得把普通线路改动整体挡死。
+	const denseBefore = Array.from({ length: 2500 }, (_, index) => line(`n-${index}`, 0, index, 10, index));
+	denseBefore[0].primitiveId = 'target';
+	const denseAfter = denseBefore.map(row => row.primitiveId === 'target' ? { ...row, endX: 12 } : row);
+	assert.equal((await run(denseAfter, { before: denseBefore, property: { endX: 12 } })).result.ok, true, 'a dense board must still verify a plain line modification');
 	console.log('PCB routing split modify tests passed');
 }
 main().catch((error) => {

@@ -343,43 +343,24 @@ function rebuildDiagnostics(nativeResult: unknown, before: Snapshot, after: Snap
 	};
 }
 
-function verifyRebuild(nativeResult: unknown, before: Snapshot, after: Snapshot, primitiveId: string | undefined, all: boolean, context: Record<string, unknown>): Record<string, unknown> {
-	if (!Array.isArray(nativeResult))
+function verifyRebuild(nativeResult: unknown, before: Snapshot, after: Snapshot, primitiveId: string | undefined, context: Record<string, unknown>): Record<string, unknown> {
+	// The native return set is advisory: JLCEDA may return only changed or newly
+	// generated fills, and a per-pour rebuild may return null for an unchanged
+	// pour (issue #95). Current-page readback is the authoritative evidence.
+	if (nativeResult !== null && nativeResult !== undefined && !Array.isArray(nativeResult))
 		throw new TypeError('EDA rebuildCopperRegions did not return a poured array.');
-	const returnedPoured = nativeResult.map(readPoured);
-	const observedPoured = primitiveId
-		? after.poured.filter(item => item.pourPrimitiveId === primitiveId)
-		: after.poured;
+	const returnedPoured = Array.isArray(nativeResult) ? nativeResult.map(readPoured) : [];
 	const returnedIds = new Set(returnedPoured.map(item => item.primitiveId));
-	if (returnedIds.size !== returnedPoured.length || returnedPoured.length !== observedPoured.length
-		|| observedPoured.some(item => !returnedIds.has(item.primitiveId))) {
-		throw new Error('EDA rebuild returned an incomplete poured fill set.');
-	}
-	const returnedPourIds = new Set(returnedPoured.map(item => item.pourPrimitiveId));
+	if (returnedIds.size !== returnedPoured.length)
+		throw new TypeError('EDA rebuild returned duplicate poured primitive IDs.');
 	const beforePourIds = new Set(before.pours.map(item => item.primitiveId));
 	const afterPourIds = new Set(after.pours.map(item => item.primitiveId));
 	if (beforePourIds.size !== afterPourIds.size || [...beforePourIds].some(id => !afterPourIds.has(id)))
 		throw new Error('EDA rebuild changed the pour boundaries.');
-	if (returnedPoured.some(item => !afterPourIds.has(item.pourPrimitiveId)))
-		throw new Error('EDA rebuild returned a fill for a missing pour.');
-	if (all && after.pours.some(item => !returnedPourIds.has(item.primitiveId)))
-		throw new Error('EDA rebuild did not return a fill for every pour.');
-	if (primitiveId && !returnedPourIds.has(primitiveId)) {
-		const beforeTargetPoured = before.poured.filter(item => item.pourPrimitiveId === primitiveId);
-		return {
-			ok: false,
-			action: 'rebuild',
-			scope: SCOPE,
-			...context,
-			reason: 'rebuild_no_target_fill',
-			applied: beforeTargetPoured.length > 0,
-			verified: false,
-			before: beforeTargetPoured,
-			after: observedPoured,
-			rebuildReturnedCount: returnedPoured.length,
-		};
-	}
+	// Anything the native did return must be readable and identical on the page.
 	for (const returned of returnedPoured) {
+		if (!afterPourIds.has(returned.pourPrimitiveId))
+			throw new Error('EDA rebuild returned a fill for a missing pour.');
 		if (primitiveId && returned.pourPrimitiveId !== primitiveId)
 			throw new Error('EDA rebuild returned a fill for a different pour.');
 		const observed = after.poured.find(item => item.primitiveId === returned.primitiveId);
@@ -390,7 +371,37 @@ function verifyRebuild(nativeResult: unknown, before: Snapshot, after: Snapshot,
 			throw new Error('EDA rebuilt fill is missing or differs on current-page readback.');
 		}
 	}
-	return { ok: true, action: 'rebuild', scope: SCOPE, ...context, verified: true, rebuildReturnedCount: nativeResult.length, ...after };
+	const targets = primitiveId ? [primitiveId] : after.pours.map(item => item.primitiveId);
+	const readable = (pourId: string): boolean => after.poured.some(item => item.pourPrimitiveId === pourId);
+	const hadFill = (pourId: string): boolean => before.poured.some(item => item.pourPrimitiveId === pourId);
+	if (primitiveId && !readable(primitiveId)) {
+		// A single targeted pour with no readable fill is a known, reportable outcome:
+		// the caller does not need quarantine to learn that the target has no fill.
+		const beforeTargetPoured = before.poured.filter(item => item.pourPrimitiveId === primitiveId);
+		return {
+			ok: false,
+			action: 'rebuild',
+			scope: SCOPE,
+			...context,
+			reason: 'rebuild_no_target_fill',
+			applied: beforeTargetPoured.length > 0,
+			verified: false,
+			before: beforeTargetPoured,
+			after: [],
+			rebuildReturnedCount: returnedPoured.length,
+		};
+	}
+	// A pour that was filled before must still have a readable fill: losing it is a
+	// real regression regardless of what the native return set claimed.
+	const lost = targets.filter(pourId => hadFill(pourId) && !readable(pourId));
+	if (lost.length > 0)
+		throw new Error(`EDA rebuild lost the readable fill for pour(s): ${lost.slice(0, 8).join(', ')}.`);
+	// No fill before and none after: neither the return set nor the page can show
+	// that this pour was rebuilt, so the write stays unknown instead of "verified".
+	const unproven = targets.filter(pourId => !hadFill(pourId) && !readable(pourId));
+	if (unproven.length > 0)
+		throw new Error(`EDA rebuild left no readable fill for targeted pour(s): ${unproven.slice(0, 8).join(', ')}.`);
+	return { ok: true, action: 'rebuild', scope: SCOPE, ...context, verified: true, verificationScope: 'page_readback', nativeReturnCoveredObservedCount: after.poured.filter(item => returnedIds.has(item.primitiveId)).length, rebuildReturnedCount: returnedPoured.length, ...after };
 }
 
 export async function handlePcbPourManageTask(payload: unknown): Promise<unknown> {
@@ -525,7 +536,7 @@ export async function handlePcbPourManageTask(payload: unknown): Promise<unknown
 				await assertSamePage(runtime, pageUuid);
 				after = await readSnapshot(runtime, pageUuid);
 				context.rebuildDiagnostics = rebuildDiagnostics(nativeResult, before, after, primitiveId, rebuildPath, attempt, nativeReturnTypes);
-				const result = verifyRebuild(nativeResult, before, after, primitiveId, payload.all === true, context);
+				const result = verifyRebuild(nativeResult, before, after, primitiveId, context);
 				if (result.ok || attempt === REBUILD_READBACK_ATTEMPTS)
 					return result;
 			}
